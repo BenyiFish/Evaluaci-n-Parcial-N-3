@@ -3,8 +3,9 @@
 Solo debe ejecutarse en el laboratorio local. El alumnado debe revisar y corregir
 los defectos; estos comentarios no enumeran las respuestas de la evaluación.
 """
-
+import hmac
 import os
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -29,10 +30,26 @@ LOGIN_FAILURES = Counter(
     "Intentos de acceso fallidos",
 )
 
+MAX_USERNAME_LEN = 80
+MAX_PASSWORD_LEN = 128
+MAX_COMMENT_LEN = 1000
+MAX_QUERY_LEN = 120
+
 
 def create_app(database_path=None):
     app = Flask(__name__)
-    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "clave-insegura-solo-laboratorio")
+
+    secret_key = os.getenv("SECRET_KEY")
+    if not secret_key:
+        secret_key = secrets.token_hex(32)
+    app.config["SECRET_KEY"] = secret_key
+
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_SECURE"] = (
+        os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+    )
+
     app.config["DATABASE_PATH"] = str(
         database_path or os.getenv("DATABASE_PATH", str(Path(__file__).with_name("securedev.db")))
     )
@@ -42,6 +59,21 @@ def create_app(database_path=None):
             g.db = sqlite3.connect(app.config["DATABASE_PATH"])
             g.db.row_factory = sqlite3.Row
         return g.db
+
+    def get_csrf_token():
+        token = session.get("_csrf_token")
+        if not token:
+            token = secrets.token_urlsafe(32)
+            session["_csrf_token"] = token
+        return token
+
+    def validate_csrf():
+        token = session.get("_csrf_token")
+        submitted = request.form.get("csrf_token", "")
+        if not token or not submitted or not hmac.compare_digest(token, submitted):
+            abort(403)
+
+    app.jinja_env.globals["csrf_token"] = get_csrf_token
 
     @app.teardown_appcontext
     def close_db(_error):
@@ -55,6 +87,20 @@ def create_app(database_path=None):
 
     @app.after_request
     def record_request(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; "
+            "img-src 'self' data:; "
+            "frame-ancestors 'none'; "
+            "form-action 'self'"
+        )
+        if "Server" in response.headers and os.getenv("STRIP_SERVER_HEADER", "false").lower() == "true":
+            del response.headers["Server"]
+
         if request.endpoint != "metrics":
             endpoint = request.endpoint or "unknown"
             HTTP_REQUESTS.labels(endpoint, request.method, str(response.status_code)).inc()
@@ -118,8 +164,9 @@ def create_app(database_path=None):
     def login():
         error = None
         if request.method == "POST":
-            username = request.form.get("username", "")
-            password = request.form.get("password", "")
+            validate_csrf()
+            username = request.form.get("username", "").strip()[:MAX_USERNAME_LEN]
+            password = request.form.get("password", "")[:MAX_PASSWORD_LEN]
             user = db().execute(
                 "SELECT id, username, password_hash FROM users WHERE username = ?", (username,)
             ).fetchone()
@@ -127,6 +174,7 @@ def create_app(database_path=None):
                 session.clear()
                 session["user_id"] = user["id"]
                 session["username"] = user["username"]
+                session["_csrf_token"] = secrets.token_urlsafe(32)
                 return redirect(url_for("index"))
             LOGIN_FAILURES.inc()
             error = "Credenciales inválidas"
@@ -134,6 +182,7 @@ def create_app(database_path=None):
 
     @app.post("/logout")
     def logout():
+        validate_csrf()
         session.clear()
         return redirect(url_for("login"))
 
@@ -146,6 +195,8 @@ def create_app(database_path=None):
         ).fetchone()
         if item is None:
             abort(404)
+        if item["owner_id"] != current_user():
+            abort(403)
         comments = db().execute(
             "SELECT body FROM comments WHERE ticket_id = ? ORDER BY id", (ticket_id,)
         ).fetchall()
@@ -155,9 +206,17 @@ def create_app(database_path=None):
     def add_comment(ticket_id):
         if not current_user():
             return redirect(url_for("login"))
-        if db().execute("SELECT id FROM tickets WHERE id = ?", (ticket_id,)).fetchone() is None:
+        validate_csrf()
+        item = db().execute(
+            "SELECT id, owner_id FROM tickets WHERE id = ?", (ticket_id,)
+        ).fetchone()
+        if item is None:
             abort(404)
-        body = request.form.get("body", "")
+        if item["owner_id"] != current_user():
+            abort(403)
+        body = request.form.get("body", "").strip()
+        if not body or len(body) > MAX_COMMENT_LEN:
+            abort(400)
         db().execute(
             "INSERT INTO comments (ticket_id, author_id, body) VALUES (?, ?, ?)",
             (ticket_id, current_user(), body),
@@ -169,9 +228,12 @@ def create_app(database_path=None):
     def search():
         if not current_user():
             return redirect(url_for("login"))
-        query = request.args.get("q", "")
-        sql = f"SELECT id, title FROM tickets WHERE title LIKE '%{query}%' ORDER BY id"
-        tickets = db().execute(sql).fetchall()
+        query = request.args.get("q", "")[:MAX_QUERY_LEN]
+        escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        tickets = db().execute(
+            "SELECT id, title FROM tickets WHERE owner_id = ? AND title LIKE ? ESCAPE '\\' ORDER BY id",
+            (current_user(), f"%{escaped_query}%"),
+        ).fetchall()
         return render_template("search.html", tickets=tickets, query=query)
 
     @app.get("/health")
